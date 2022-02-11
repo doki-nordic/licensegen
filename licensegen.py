@@ -10,6 +10,8 @@ import tempfile
 import sys
 from tokenize import group
 
+# TODO: handle dual license in tinycrypt ecc_dh
+
 class GeneratorError(Exception):
     pass
 
@@ -37,24 +39,40 @@ def validate_build_directory():
     if not os.path.exists(Path(args.build_directory) / 'build.ninja'):
         raise GeneratorError(f'Build directory "{args.build_directory}" does not contain "build.ninja" file.')
 
-def generate_deps():
+def ninja_tool_generate(command):
     ninja_out_name = tempfile.mktemp('.txt', 'licgen_stdout_')
     with open(ninja_out_name, 'w') as ninja_out_fd:
         ninja_err_name = tempfile.mktemp('.txt', 'licgen_stderr_')
         with open(ninja_err_name, 'w') as ninja_err_fd:
             try:
-                cp = subprocess.run('ninja -t deps', shell=True, stdout=ninja_out_fd,
+                cp = subprocess.run(command, shell=True, stdout=ninja_out_fd,
                                     stderr=ninja_err_fd, cwd=args.build_directory)
             except Exception as e:
-                raise GeneratorError(f'Unable to start "ninja -t deps" command: {str(e)}')
+                raise GeneratorError(f'Unable to start "{command}" command: {str(e)}')
     with open(ninja_err_name, 'r') as ninja_err_fd:
         err = ninja_err_fd.read().strip()
         if len(err) > 0:
             eprint(err)
     if cp.returncode != 0:
-        raise GeneratorError(f'"ninja -t deps" command exited with error code {cp.returncode}')
+        raise GeneratorError(f'"{command}" command exited with error code {cp.returncode}')
     os.unlink(ninja_err_name)
     return ninja_out_name
+
+
+def parse_targets_file(all_files, deps_file_name):
+    global args
+    with open(deps_file_name, 'r') as fd:
+        line_no = 0
+        while True:
+            line = fd.readline()
+            line_no += 1
+            if len(line) == 0:
+                break
+            line = line.strip()
+            if len(line) == 0:
+                continue
+            file = Path(args.build_directory, line).resolve()
+            all_files.add(file)
 
 
 def parse_deps_file(all_files, deps_file_name):
@@ -82,17 +100,17 @@ spdx_licenses = { '': set() }
 spdx_licenses_names = { '': 'None' }
 
 def simplify_license_text(text):
-    text = re.sub(r'[^a-z0-9]+', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'[^a-z]+', '', text, flags=re.IGNORECASE)
     text = text.strip().lower()
     return text
 
 def load_license_texts():
     global license_texts
     this_path = Path(__file__).absolute().parents[0]
-    with open(this_path / 'licenses.yaml', 'r') as fs:
+    with open(this_path / 'config.yaml', 'r') as fs:
         texts = yaml.safe_load(fs)
     license_texts = []
-    for t in texts['licenses']:
+    for t in texts['license-texts']:
         text = simplify_license_text(t['text'])
         license_texts.append((t['id'], text))
     for a in license_texts:
@@ -110,6 +128,23 @@ def add_spdx_license(file_name, name):
     if lower_name not in spdx_licenses:
         spdx_licenses[lower_name] = set()
     spdx_licenses[lower_name].add(file_name)
+
+def detect_spdx_tag(source):
+    result = set()
+    for m in re.finditer(r'SPDX-License-Identifier\s*:?\s*([^\r\n\*]+)', source, re.IGNORECASE):
+        result.add(m.group(1).strip())
+    return result
+
+def detect_license_text(source):
+    global license_texts
+    result = set()
+    source = simplify_license_text(source)
+    for spdx_id, text in license_texts:
+        if source.find(text) >= 0:
+            result.add(spdx_id)
+    return result
+
+
 
 def parse_spdx_license(file_name, source):
     m = tuple(re.finditer(r'SPDX-License-Identifier\s*:?\s*([^\r\n\*]+)', source, re.IGNORECASE))
@@ -131,16 +166,38 @@ def parse_license_text(file_name, source):
             return True
     return False
 
+def from_west(file, base_dir, files):
+    base_dir = Path(base_dir)
+    with open(file, 'r') as fd:
+        while True:
+            line = fd.readline()
+            if len(line) == 0:
+                break
+            line = line.strip()
+            #FileName: ./modules/crypto/tinycrypt/lib/source/aes_decrypt.c
+            m = re.fullmatch(r'FileName\s*:\s*(.+)', line)
+            if m is None:
+                continue
+            fullpath = (base_dir / m.group(1)).absolute().resolve()
+            west_files.add(fullpath)
+    
+west_files = set()
+from_west('/home/doki/work/ncs/nrf/samples/bluetooth/rpc_host/build_nrf5340dk_nrf5340_cpunet/spdx/zephyr.spdx', '/home/doki/work/ncs', west_files)
+from_west('/home/doki/work/ncs/nrf/samples/bluetooth/rpc_host/build_nrf5340dk_nrf5340_cpunet/spdx/build.spdx', '/home/doki/work/ncs', west_files)
+from_west('/home/doki/work/ncs/nrf/samples/bluetooth/rpc_host/build_nrf5340dk_nrf5340_cpunet/spdx/app.spdx', '/home/doki/work/ncs', west_files)
+
 try:
     all_files = set()
     args = parse_args()
     validate_build_directory()
     load_license_texts()
-    deps_file_name = generate_deps()
+    deps_file_name = ninja_tool_generate('ninja -t deps')
     parse_deps_file(all_files, deps_file_name)
+    targets_file_name = ninja_tool_generate('ninja -t targets rule')
+    parse_targets_file(all_files, targets_file_name)
     for file_name in all_files:
         try:
-            with open(file_name) as fd:
+            with open(file_name, 'r', encoding='8859') as fd:
                 source = fd.read()
         except:
             spdx_licenses[''].add(file_name)
@@ -154,6 +211,9 @@ try:
         for f in v:
             print(f'    {f}')
     print(f'Total dependent source files: {len(all_files)}')
+    missing = west_files - all_files
+    for f in missing:
+        print(f)
 except GeneratorError as e:
     eprint(str(e))
     if args.debug:

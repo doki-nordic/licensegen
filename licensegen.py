@@ -1,6 +1,7 @@
 
 import argparse
 from genericpath import exists
+from math import ceil, floor
 import os
 import yaml
 from pathlib import Path
@@ -27,6 +28,7 @@ def parse_args():
                         help='Show details in case of exception (for debugging purpose).')
     parser.add_argument('--help', action='help',
                         help='Show this help message and exit')
+    sys.argv = ['a', '/home/doki/work/ncs/nrf/samples/bluetooth/rpc_host/build_nrf5340dk_nrf5340_cpunet']
     return parser.parse_args()
 
 def validate_build_directory():
@@ -97,42 +99,70 @@ def parse_deps_file(all_files, deps_file_name):
             all_files.add(file)
 
 spdx_licenses = { '': set() }
-spdx_licenses_names = { '': 'None' }
+spdx_licenses_names = { '': 'NOASSERTION' }
 
 def simplify_license_text(text):
     text = re.sub(r'[^a-z]+', '', text, flags=re.IGNORECASE)
     text = text.strip().lower()
     return text
 
+def explode_list(text):
+    return re.split(r'\s*[,;]\s*', text)
+
 def load_license_texts():
-    global license_texts
+    global license_texts, file_types
     this_path = Path(__file__).absolute().parents[0]
     with open(this_path / 'config.yaml', 'r') as fs:
         texts = yaml.safe_load(fs)
     license_texts = []
     for t in texts['license-texts']:
-        text = simplify_license_text(t['text'])
+        if 'detect-pattern' in t:
+            text = ''
+            arr = t['detect-pattern'].split('</regex>')
+            for part in arr:
+                plain, *regex = part.split('<regex>') + [ '' ]
+                text += simplify_license_text(plain) + ''.join(regex)
+            text = re.compile(text)
+        elif 'detect-text' in t:
+            text = simplify_license_text(t['detect-text'])
+        else:
+            text = simplify_license_text(t['text'])
         license_texts.append((t['id'], text))
     for a in license_texts:
         for b in license_texts:
-            if (a[0] != b[0]) and (a[1].find(b[1]) >= 0):
-                raise Exception(f'License text for {b[0]} is part of {a[0]}. '
-                    'This situation is not implemented. Implement it before adding to '
-                    'licenses.yaml file.')
+            pass#TODO: later if (a[0] != b[0]) and (a[1].find(b[1]) >= 0):
+                # raise Exception(f'License text for {b[0]} is part of {a[0]}. '
+                #     'This situation is not implemented. Implement it before adding to '
+                #     'licenses.yaml file.')
+    file_types = []
+    for t in texts['file-types']:
+        if 'extensions' in t:
+            re_str = r'.*\.(' + '|'.join((ext for ext in explode_list(t['extensions']))) + ')'
+        else:
+            re_str = t['regexp']
+        file_types.append({
+            're': re_str,
+            'for': set(explode_list(t['for'] if 'for' in t else 'app,global')),
+            'category': t['category'] if 'category' in t else 'Uncategorised',
+            'exclude': t['exclude'] if 'exclude' in t else False
+        })
+
 
 def add_spdx_license(file_name, name):
     global spdx_licenses, spdx_licenses_names
     name = name.strip()
     lower_name = name.lower()
-    spdx_licenses_names[lower_name] = name
     if lower_name not in spdx_licenses:
+        spdx_licenses_names[lower_name] = name
         spdx_licenses[lower_name] = set()
     spdx_licenses[lower_name].add(file_name)
 
 def detect_spdx_tag(source):
     result = set()
-    for m in re.finditer(r'SPDX-License-Identifier\s*:?\s*([^\r\n\*]+)', source, re.IGNORECASE):
-        result.add(m.group(1).strip())
+    for m in re.finditer(r'SPDX-License-Identifier\s*:?\s*([a-z0-9 :\(\)\.\+\-]+)', source, re.IGNORECASE):
+        id = m.group(1).strip()
+        if len(id):
+            result.add(id)
     return result
 
 def detect_license_text(source):
@@ -140,80 +170,112 @@ def detect_license_text(source):
     result = set()
     source = simplify_license_text(source)
     for spdx_id, text in license_texts:
-        if source.find(text) >= 0:
+        if type(text) is re.Pattern:
+            if text.search(source) is not None:
+                result.add(spdx_id)
+        elif source.find(text) >= 0:
             result.add(spdx_id)
     return result
 
+scanned_dirs = set()
+scanned_files = set()
+files_from_spdx = dict()
 
+def detect_license_spdx_dir(dir_path, file_path):
+    global scanned_dirs, scanned_files
+    dir_path = Path()
+    file_path = Path()
+    if str(dir_path) in scanned_dirs:
+        return
+    search_files = []
+    search_dirs = []
+    for f in os.listdir(dir_path):
+        f_path = dir_path / f
+        if f_path.is_file():
+            if f.lower().endswith('.spdx'):
+                search_files.append(f_path)
+        elif f_path.is_dir():
+            if f.lower().find('spdx') >= 0:
+                search_dirs.append(f_path)
+    scanned_dirs.add(str(dir_path))
 
-def parse_spdx_license(file_name, source):
-    m = tuple(re.finditer(r'SPDX-License-Identifier\s*:?\s*([^\r\n\*]+)', source, re.IGNORECASE))
-    if len(m) > 1:
-        raise GeneratorError(f'{file_name}:0: File contains more than one SPDX-License-Identifier')
-    elif len(m) == 1:
-        add_spdx_license(file_name, m[0].group(1))
-    elif parse_license_text(file_name, source):
-        pass
-    else:
-        spdx_licenses[''].add(file_name)
+def detect_license_spdx_file(file_name):
+    global files_from_spdx
+    path = Path(file_name).absolute()
+    if str(path) in files_from_spdx:
+        return files_from_spdx[str(path)]['id']
+    for parent in path.parents:
+        ids = detect_license_spdx_dir(parent, path)
+        if ids is not None:
+            return ids
+    return set()
 
-def parse_license_text(file_name, source):
-    global license_texts
-    source = simplify_license_text(source)
-    for spdx_id, text in license_texts:
-        if source.find(text) >= 0:
-            add_spdx_license(file_name, spdx_id)
-            return True
-    return False
+def detect_license(file_name, source):
+    ids = detect_spdx_tag(source)
+    ids = ids.union(detect_license_text(source))
+    ids = ids.union(detect_license_spdx_file(file_name))
+    if len(ids) == 0:
+        add_spdx_license(file_name, '')
+    for id in ids:
+        add_spdx_license(file_name, id)
 
-def from_west(file, base_dir, files):
-    base_dir = Path(base_dir)
-    with open(file, 'r') as fd:
-        while True:
-            line = fd.readline()
-            if len(line) == 0:
-                break
-            line = line.strip()
-            #FileName: ./modules/crypto/tinycrypt/lib/source/aes_decrypt.c
-            m = re.fullmatch(r'FileName\s*:\s*(.+)', line)
-            if m is None:
-                continue
-            fullpath = (base_dir / m.group(1)).absolute().resolve()
-            west_files.add(fullpath)
-    
-west_files = set()
-from_west('/home/doki/work/ncs/nrf/samples/bluetooth/rpc_host/build_nrf5340dk_nrf5340_cpunet/spdx/zephyr.spdx', '/home/doki/work/ncs', west_files)
-from_west('/home/doki/work/ncs/nrf/samples/bluetooth/rpc_host/build_nrf5340dk_nrf5340_cpunet/spdx/build.spdx', '/home/doki/work/ncs', west_files)
-from_west('/home/doki/work/ncs/nrf/samples/bluetooth/rpc_host/build_nrf5340dk_nrf5340_cpunet/spdx/app.spdx', '/home/doki/work/ncs', west_files)
+def is_included(mode, path):
+    global file_types
+    for type in file_types:
+        if mode not in type['for']:
+            continue
+        if re.fullmatch(type['re'], str(path)) is not None:
+            return not type['exclude']
+    raise Exception('"config.yaml" does not contains default fallback file type.')
+
+def find_files(path, all_files, processed):
+    real = str(path.resolve())
+    if real in processed:
+        return
+    processed.add(real)
+    for f in os.listdir(path):
+        f = path / f
+        if f.is_file():
+            if is_included('global', f):
+                all_files.add(str(f))
+        if f.is_dir():
+            find_files(f, all_files, processed)
 
 try:
     all_files = set()
     args = parse_args()
     validate_build_directory()
     load_license_texts()
-    deps_file_name = ninja_tool_generate('ninja -t deps')
-    parse_deps_file(all_files, deps_file_name)
-    targets_file_name = ninja_tool_generate('ninja -t targets rule')
-    parse_targets_file(all_files, targets_file_name)
+    # deps_file_name = ninja_tool_generate('ninja -t deps')
+    # parse_deps_file(all_files, deps_file_name)
+    # targets_file_name = ninja_tool_generate('ninja -t targets rule')
+    # parse_targets_file(all_files, targets_file_name)
+    processed = set()
+    find_files(Path('/home/doki/work/ncs').resolve(), all_files, processed)
+    #all_files = {'/home/doki/work/ncs/zephyr/scripts/ci/check_compliance.py'}
+    print(f'Total dependent source files: {len(all_files)}')
+    num = 0
+    step = max(1, len(all_files) // 10)
     for file_name in all_files:
+        if (num % step == 0):
+            print(f'Processed {num} of {len(all_files)} files')
+        num += 1
         try:
             with open(file_name, 'r', encoding='8859') as fd:
-                source = fd.read()
+                source = fd.read(65536)
         except:
             spdx_licenses[''].add(file_name)
             eprint(f'{file_name}:0: Error reading file')
             continue
         if len(source.strip()) == 0:
             continue
-        parse_spdx_license(file_name, source)
+        detect_license(file_name, source)
     for k, v in spdx_licenses.items():
-        print(spdx_licenses_names[k])
+        print(f'SPDX-License-Identifier: {spdx_licenses_names[k]}')
         for f in v:
             print(f'    {f}')
-    print(f'Total dependent source files: {len(all_files)}')
-    missing = west_files - all_files
-    for f in missing:
-        print(f)
+        print(f'        count: {len(v)}')
+        exit()
 except GeneratorError as e:
     eprint(str(e))
     if args.debug:
